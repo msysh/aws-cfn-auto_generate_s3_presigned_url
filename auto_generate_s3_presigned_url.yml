@@ -1,0 +1,277 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Auto generate S3 pre-signed URL.
+Parameters:
+  IAMUserName:
+    Type: String
+    Default: AutoGenerateS3PreSignedUrl
+    ConstraintDescription: '[A-Za-z0-9\+=,\.@_\-]+'
+    Description: Enter IAM user name.
+  BucketName:
+    Type: String
+    ConstraintDescription: '[A-Za-z0-9\-]+'
+    Description: Enter S3 bucket name.
+  SnsDisplayName:
+    Type: String
+    Default: PreSignURL
+    MinLength: 1
+    MaxLength: 10
+    Description: Enter SNS display name. (It's set e-mail subject.)
+  Mail:
+    Type: String
+    Description: Enter notify mail address.
+  NameOfSecretsManager:
+    Type: String
+    Default: AutoGenerateS3PreSignedUrl/accessKey
+    ConstraintDescription: '[A-Za-z0-9_\-\/]+'
+    MinLength: 1
+    Description: Enter name of Secrets Manager for access key.
+Resources:
+  S3Bucket:
+    Type: 'AWS::S3::Bucket'
+    DependsOn: LambdaPermission
+    Properties:
+      BucketName: !Ref BucketName
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: True
+        IgnorePublicAcls: True
+        BlockPublicPolicy: True
+        RestrictPublicBuckets: True
+      NotificationConfiguration:
+        LambdaConfigurations:
+          -
+            Function: !GetAtt Lambda.Arn
+            Event: "s3:ObjectCreated:*"
+  LambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !GetAtt Lambda.Arn
+      Principal: 's3.amazonaws.com'
+      SourceArn: !Sub 'arn:aws:s3:::${BucketName}'
+  SnsTopic:
+    Type: 'AWS::SNS::Topic'
+    Properties:
+      DisplayName: !Ref SnsDisplayName
+      KmsMasterKeyId: alias/aws/sns
+      TopicName: AutoGenerateS3PreSignedUrl
+  SnsSubscription:
+    Type: 'AWS::SNS::Subscription'
+    Properties:
+      Endpoint: !Ref Mail
+      Protocol: email
+      TopicArn: !Ref SnsTopic
+  IamUser:
+    Type: 'AWS::IAM::User'
+    Properties:
+      UserName: !Ref IAMUserName
+  UserAccessKey:
+    Type: 'AWS::IAM::AccessKey'
+    Properties:
+      UserName: !Ref IamUser
+  SecretsManager:
+    Type: 'AWS::SecretsManager::Secret'
+    Properties:
+      Name: !Ref NameOfSecretsManager
+      KmsKeyId: alias/aws/secretsmanager
+      SecretString: !Sub |
+        {
+          "access_key_id": "${UserAccessKey}",
+          "secret_access_key": "${UserAccessKey.SecretAccessKey}"
+        }
+  PolicyForUser:
+    Type: 'AWS::IAM::ManagedPolicy'
+    Properties:
+      ManagedPolicyName: AutoGenerateS3PreSignedUrl_IAMUser
+      PolicyDocument: {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Effect": "Allow",
+            "Action": [
+              "s3:GetObject"
+            ],
+            "Resource": [
+              !GetAtt S3Bucket.Arn,
+              !Sub '${S3Bucket.Arn}/*'
+            ]
+          },
+          {
+            "Effect": "Allow",
+            "Action": "s3:ListBucket",
+            "Resource": "arn:aws:s3:::*/*"
+          }
+        ]
+      }
+      Users:
+        - !Ref IamUser
+  RoleForLambda:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: AutoGenerateS3PreSignedUrl_LambdaRole
+      AssumeRolePolicyDocument: {
+        "Version" : "2012-10-17",
+        "Statement": [
+          {
+            "Effect": "Allow",
+            "Principal": {
+              "Service": [ "lambda.amazonaws.com" ]
+            },
+            "Action": [ "sts:AssumeRole" ]
+          }
+        ]
+      }
+      Path: /
+      Policies:
+        -
+          PolicyName: sns
+          PolicyDocument: {
+            "Version" : "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Action": "sns:Publish",
+                "Resource": !Ref SnsTopic
+              }
+            ]
+          }
+        -
+          PolicyName: cloudwatchlogs
+          PolicyDocument: {
+            "Version" : "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Action": ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"],
+                "Resource": "arn:aws:logs:*:*:*"
+              }
+            ]
+          }
+        -
+          PolicyName: secretsmanager
+          PolicyDocument: {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Action": ["secretsmanager:GetSecretValue"],
+                "Resource": !Ref SecretsManager
+              }
+            ]
+          }
+  Lambda:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: AutoGenerateS3PreSignedUrl
+      Runtime: python3.7
+      Handler: 'index.lambda_handler'
+      Role: !GetAtt RoleForLambda.Arn
+      MemorySize: 128
+      Timeout: 60
+      Environment:
+        Variables:
+          'SNS_TOPIC_ARN': !Ref SnsTopic
+          'EXPIRE_DAYS': '7'
+          'SECRET_NAME': !Ref NameOfSecretsManager
+      Code:
+        ZipFile: !Sub |
+          from __future__ import print_function
+          import json
+          import os
+          import base64
+          import boto3
+          import urllib.parse
+          from botocore.exceptions import ClientError
+
+          sns = boto3.client('sns')
+
+          secret_name = os.environ['SECRET_NAME']
+          expires_days = int(os.environ['EXPIRE_DAYS']) if 'EXPIRE_DAYS' in os.environ else 7
+          topic_arn = os.environ['SNS_TOPIC_ARN']
+
+          def lambda_handler(event, context):
+
+              bucket = event['Records'][0]['s3']['bucket']['name']
+              key = urllib.parse.unquote_plus(event['Records'][0]['s3']['object']['key'], encoding='utf-8')
+              print("Bucket : {0}, Key : {1}".format(bucket, key))
+
+              if key[-1:] == '/':
+                print("Created directory. Skip generate pre-signed url.")
+                return {
+                  'statusCode': 209,
+                  'key': key,
+                  'body': 'Created directory. Skip generate pre-signed url.'
+                }
+
+              secret = get_secret()
+              
+              s3 = boto3.client('s3',
+                              aws_access_key_id = secret['access_key_id'],
+                              aws_secret_access_key = secret['secret_access_key'])
+              
+              url = get_presigned_url(s3, bucket, key, expires_days)
+              print("Generated URL : {}".format(url))
+              
+              subject = "PreSigned URL for {0}".format(key)
+              message = "Key : {0}\nPre-Signed URL : {1}".format(key, url)
+              
+              result = send_mail(subject, message)
+              print(json.dumps(result))
+
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps(result)
+              }
+
+
+          def get_secret():
+
+              session = boto3.session.Session()
+              client = session.client(
+                  service_name='secretsmanager'
+              )
+
+              secret = {}
+              
+              try:
+                  get_secret_value_response = client.get_secret_value(
+                      SecretId=secret_name
+                  )
+              except ClientError as e:
+                  raise e
+              else:
+                  secret_string = get_secret_value_response['SecretString']
+                  secret = json.loads(secret_string)
+
+              return secret
+
+
+          def get_presigned_url(s3, bucket, key, expires_days=7):
+              url = s3.generate_presigned_url(
+                  ClientMethod = 'get_object',
+                  Params = { 'Bucket': bucket, 'Key': key },
+                  ExpiresIn = expires_days * 24 * 60 * 60,
+                  HttpMethod = 'GET')
+                  
+              return url
+
+
+          def send_mail(subject, message):
+
+              request = {
+                  'TopicArn': topic_arn,
+                  'Subject': subject,
+                  'Message': message
+              }
+              
+              response = sns.publish(**request)
+              
+              return response
+# Outputs:
+  # DebugAccessKeyId:
+  #   Value: !Ref UserAccessKey
+  # DebugSecretAccessKey:
+  #   Value: !GetAtt UserAccessKey.SecretAccessKey
